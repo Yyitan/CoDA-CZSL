@@ -1,0 +1,58 @@
+--- a/configs/utzappos.yml
++++ b/configs/utzappos.yml
+@@ -6,31 +6,46 @@
+   num_units: 32
+   m_layers: 9
+   adapter_dim: 64
++  # CoDA toggles
++  use_coda: true
++  use_ocad: true
++  use_mid: true
++  use_faca: true
+ 
+ train:
+   dataset: ut-zappos
+   step_size: 1
+   gamma: 0.5
+   lr: 0.00025
+-  train_batch_size: 64   
++  train_batch_size: 64
+   epochs: 15
+   context_length: 8
+   seed: 0
+   val_metric: AUC
+   save_final_model: True
+-  save_path: output/UT
++  save_path: weight
+   att_loss_weight: 0.5
+   obj_loss_weight: 0.5
+   com_loss_weight: 1
+   glb_loss_weight: 1
++  # CoDA hyperparams
++  lambda_MI: 0.05
++  lambda_aug: 0.2
++  lambda_orth: 0.01
++  club_lr: 0.0001
++  mi_warmup_epochs: 2
++  n_synth_per_batch: 4
++  tau_high: 0.8
++  bank_size: 128
++  faca_warmup_epochs: 1
++  feasibility_train: feasibilities/feasibility_zp.pt
+ 
+ test:
+-  open_world: true   # If it’s the open-world setting, just set it to "true"
+-  eval_batch_size: 64  
+-  feasibility: feasibilities/feasibility_zp.pt 
++  eval_batch_size: 64
++  feasibility: feasibilities/feasibility_zp.pt
+   threshold: 0.4705232256
+-  threshold_trials: 50  
+-  beta: 0.65 
++  threshold_trials: 50
++  beta: 0.65
++  gamma_feas: 0.1
+ 
+-  load_model: weight/final_model.pt # Path of the trained model
+-
++  load_model: weight/val_best.pt

@@ -1,0 +1,39 @@
+--- a/test.py
++++ b/test.py
+@@ -565,20 +565,26 @@
+     if args.load_model:
+         model.load_state_dict(torch.load(args.load_model,weights_only=True))
+ 
+-    predict_logits_func = predict_logits   
+-    feasibility_path = args.feasibility
+-    unseen_scores = torch.load(
+-        feasibility_path,
+-        map_location='cpu',weights_only=True)['feasibility']
++    predict_logits_func = predict_logits
+     with torch.no_grad():
+         evaluator = Evaluator(test_dataset)
+         all_logits, all_attr_gt, all_obj_gt, all_pair_gt = predict_logits_func(
+             model, test_dataset,args)
+-        all_logits = threshold_with_feasibility(
+-            all_logits,
+-            test_dataset.seen_mask,
+-            threshold=args.threshold,
+-            feasiblity=unseen_scores)
++        if args.open_world:
++            feasibility_path = args.feasibility
++            unseen_scores = torch.load(
++                feasibility_path,
++                map_location="cpu",weights_only=True)["feasibility"]
++            all_logits = threshold_with_feasibility(
++                all_logits,
++                test_dataset.seen_mask,
++                threshold=args.threshold,
++                feasiblity=unseen_scores)
++        # CoDA: soft feasibility log-bias for open-world inference.
++        gamma_feas = float(getattr(args, 'gamma_feas', 0.0))
++        if args.open_world and gamma_feas > 0:
++            log_feas = torch.log(unseen_scores.clamp(min=1e-6))
++            all_logits = all_logits + gamma_feas * log_feas.unsqueeze(0)
+         test_stats = test(
+             test_dataset,
+             evaluator,

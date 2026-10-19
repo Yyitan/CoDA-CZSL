@@ -1,0 +1,43 @@
+--- a/flags.py
++++ b/flags.py
+@@ -2,15 +2,35 @@
+ 
+ parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+ 
+-parser.add_argument('--config', default='CAMS/configs/utzappos.yml', help='Path of the config file') 
++parser.add_argument('--config', default='CAMS/configs/utzappos.yml', help='Path of the config file')
+ parser.add_argument('--dataset_path', default='ut-zap50k', help='Path of the dataset')
+ parser.add_argument('--splitname', default='compositional-split-natural', help="Dataset split")
+ parser.add_argument('--open_world', action='store_true', default=False, help='perform open world experiment')
+ parser.add_argument("--seed", help="seed value", default=0, type=int)
+ parser.add_argument('--bias', type=float, default=1e3, help='Bias value for unseen concepts')
+-parser.add_argument("--weight_decay", help="weight decay", type=float, default=1e-5) #1e-5
++parser.add_argument("--weight_decay", help="weight decay", type=float, default=1e-5)
+ parser.add_argument("--save_every_n", default=5, type=int, help="saves the model every n epochs")
+ 
+-parser.add_argument('--topk', type=int, default=1,help="Compute topk accuracy")
+-parser.add_argument('--threshold', default=None,help="Apply a specific threshold at test time for the hard masking")
+-parser.add_argument('--threshold_trials', type=int, default=50,help="how many threshold values to try")
++parser.add_argument('--topk', type=int, default=1, help="Compute topk accuracy")
++parser.add_argument('--threshold', default=None, help="Apply a specific threshold at test time for the hard masking")
++parser.add_argument('--threshold_trials', type=int, default=50, help="how many threshold values to try")
++
++# ---- CoDA additions (also overridable via YAML configs) ----
++parser.add_argument('--use_coda', action='store_true', default=True, help='Enable CoDA modules (OCAD/MID/FACA).')
++parser.add_argument('--use_ocad', action='store_true', default=True, help='Enable object-conditioned attribute decoder.')
++parser.add_argument('--use_mid', action='store_true', default=True, help='Enable CLUB MI minimization.')
++parser.add_argument('--use_faca', action='store_true', default=True, help='Enable feasibility-aware compositional augmentation.')
++
++parser.add_argument('--lambda_MI', type=float, default=0.1, help='Weight on the CLUB MI upper bound.')
++parser.add_argument('--lambda_aug', type=float, default=0.3, help='Weight on the FACA synthetic CE loss.')
++parser.add_argument('--lambda_orth', type=float, default=0.01, help='Weight on the projection-head orthogonal regularizer.')
++parser.add_argument('--club_lr', type=float, default=1e-4, help='Learning rate for the CLUB q_phi network.')
++parser.add_argument('--mi_warmup_epochs', type=int, default=1, help='Linear warmup of lambda_MI for this many epochs.')
++
++parser.add_argument('--n_synth_per_batch', type=int, default=8, help='Number of synthetic compositions per training step.')
++parser.add_argument('--tau_high', type=float, default=0.7, help='Feasibility threshold to consider a pair sampleable.')
++parser.add_argument('--bank_size', type=int, default=128, help='Per-class feature bank capacity.')
++parser.add_argument('--faca_warmup_epochs', type=int, default=1, help='Skip FACA for the first N epochs (bank warmup).')
++parser.add_argument('--feasibility_train', type=str, default=None, help='Optional override for the training-time feasibility .pt path.')
++
++parser.add_argument('--gamma_feas', type=float, default=0.3, help='Open-world soft feasibility log-bias weight at inference.')

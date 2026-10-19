@@ -1,0 +1,68 @@
+--- a/model/configure_model.py
++++ b/model/configure_model.py
+@@ -1,22 +1,53 @@
+ import torch
++
+ from model.cams import CAMS
+ 
+-def configure_model(args,dataset):
+-    
+-    cams = CAMS(args,dataset)
+-    keywords = ['csp','norm','tr_','adapter','proj_att','proj_obj','proj_com','temp_logit','cross_attention','latent_units']
+-    
+-    # Freeze the pre-trained CLIP parameters.
++
++def configure_model(args, dataset):
++    """Build CoDA-CZSL (a.k.a. CAMS class), set up two optimizers.
++
++    Returns (model, optimizer_main, optimizer_club). For backward compat with
++    callers that unpack `(model, optimizer)`, this function also tolerates being
++    called via `model, optimizer = configure_model(...)` by returning a tuple
++    where the second element is the main optimizer. The CLUB optimizer is
++    attached to the model as `model.club_optimizer`.
++    """
++
++    cams = CAMS(args, dataset)
++
++    # Trainable: CAMS's original list + CoDA-specific modules.
++    main_keywords = [
++        "csp", "norm", "tr_", "adapter", "proj_att", "proj_obj", "proj_com",
++        "temp_logit", "cross_attention", "latent_units",
++        # CoDA additions:
++        "film", "ln_film", "fuser",
++    ]
++
++    main_params, club_params = [], []
+     for name, param in cams.named_parameters():
+         param.requires_grad = False
+-        if any(keyword in name for keyword in keywords):
++        if "club" in name:
+             param.requires_grad = True
+-    
+-    optimizer = torch.optim.Adam(
+-        cams.parameters(),
++            club_params.append(param)
++            continue
++        if any(k in name for k in main_keywords):
++            param.requires_grad = True
++            main_params.append(param)
++
++    optimizer_main = torch.optim.Adam(
++        main_params,
+         lr=args.lr,
+-        weight_decay=args.weight_decay
++        weight_decay=args.weight_decay,
+     )
+ 
+-    return cams, optimizer
++    if len(club_params) > 0:
++        optimizer_club = torch.optim.Adam(
++            club_params,
++            lr=getattr(args, "club_lr", args.lr),
++            weight_decay=0.0,
++        )
++    else:
++        optimizer_club = None
++    cams.club_optimizer = optimizer_club  # convenience attach
+ 
++    return cams, optimizer_main

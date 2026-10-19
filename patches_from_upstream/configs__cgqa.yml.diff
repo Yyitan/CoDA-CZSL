@@ -1,0 +1,57 @@
+--- a/configs/cgqa.yml
++++ b/configs/cgqa.yml
+@@ -4,32 +4,48 @@
+   ctx_init: ["a photo of ", "a photo of ", "a photo of "]
+   clip_model: "/DATACENTER3/user/lyt/czsl/CLIP-main/ViT-L-14.pt"
+   num_units: 32
+-  m_layers: 12  
++  m_layers: 12
+   adapter_dim: 128
++  # CoDA toggles
++  use_coda: true
++  use_ocad: true
++  use_mid: true
++  use_faca: true
+ 
+ train:
+   dataset: cgqa
+   step_size: 5
+   gamma: 0.5
+   lr: 0.0001
+-  train_batch_size: 64   
++  train_batch_size: 64
+   epochs: 15
+   context_length: 8
+   seed: 0
+   val_metric: AUC
+   save_final_model: True
+-  save_path: output/cgqa_crdiff
++  save_path: output/cgqa
+   att_loss_weight: 0.5
+   obj_loss_weight: 0.5
+   com_loss_weight: 1
+   glb_loss_weight: 1
++  # CoDA hyperparams
++  lambda_MI: 0.15
++  lambda_aug: 0.5
++  lambda_orth: 0.01
++  club_lr: 0.0001
++  mi_warmup_epochs: 2
++  n_synth_per_batch: 16
++  tau_high: 0.6
++  bank_size: 128
++  faca_warmup_epochs: 1
++  feasibility_train: feasibilities/feasibility_cgqa.pt
+ 
+ test:
+-  open_world: true  # If it’s the open-world setting, just set it to "true"
+   eval_batch_size: 64
+   feasibility: feasibilities/feasibility_cgqa.pt
+   threshold: 0.4228139529
+   threshold_trials: 50
+-  beta: 0.85  
+-  load_model: output/cgqa/final_model.pt # Path of the trained model
++  beta: 0.85
++  gamma_feas: 0.4
+ 
++  load_model: output/cgqa/val_best.pt

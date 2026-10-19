@@ -1,0 +1,337 @@
+--- a/model/cams.py
++++ b/model/cams.py
+@@ -1,84 +1,264 @@
++import os
++from itertools import product
++
+ import torch
+ from torch import nn
++import torch.nn.functional as F
++
+ from clip_modules import clip
+-import torch.nn.functional as F
++from clip_modules.text_encoder import CustomTextEncoder
++
+ from model.csp import CSPInterface
+-from clip_modules.text_encoder import CustomTextEncoder
+-
+-""""
+-    CAMS: Towards Compositional Zero-Shot Learning via Gated Cross-Attention and Multi-Space Disentanglement 
++from model.coda_modules import CLUB, ComposeFuser, FeatureBank
++
++
++"""CoDA-CZSL — Conditional Disentanglement with Feasibility-Aware Augmentation.
++
++Built on top of CAMS (arXiv:2511.16378). The CAMS visual branches (GCA +
++multi-space disentanglement + global) are reused; this file adds:
++  * CLUB-based MI minimization between f_a and f_o   (MID)
++  * Feasibility-aware compositional augmentation     (FACA)
++  * Orthogonal regularization on attribute/object projection heads
++The OCAD (object-conditioned attribute decoder via FiLM) lives in
++clip_modules/gca.py inside VisionTransformer.
+ """
+ 
++
+ class CAMS(nn.Module):
+-
+-    def __init__(self,args,dataset):
+-        super(CAMS, self).__init__()
++    """Kept the class name `CAMS` so configure_model.py / checkpoints stay compatible.
++
++    Despite the name, this is the CoDA-CZSL model when args.use_coda is True
++    (default). Set args.use_coda=False to fall back to plain CAMS behavior.
++    """
++
++    def __init__(self, args, dataset):
++        super().__init__()
+         self.args = args
+         self.dset = dataset
+-        
+-        self.clip_model = clip.load_clip(self.args) # Load the pre-trained CLIP. See "Learning Transferable Visual Models From Natural Language Supervision".
++
++        self.clip_model = clip.load_clip(self.args)
+         self.image_encoder = self.clip_model.encode_image
+         self.text_encoder = CustomTextEncoder(self.clip_model)
+-        
+-        self.csp = CSPInterface(clip.tokenize, self.clip_model, self.dset,self.args) # Use the soft prompt method. See "Troika: Multi-Path Cross-Modal Traction for Compositional Zero-Shot Learning".
++
++        self.csp = CSPInterface(clip.tokenize, self.clip_model, self.dset, self.args)
+         attr2idx = self.dset.attr2idx
+         obj2idx = self.dset.obj2idx
+-        self.train_pairs = torch.tensor([(attr2idx[attr], obj2idx[obj])
+-                                         for attr, obj in self.dset.train_pairs])        
+-
+-        self.temp_logit = nn.Parameter(self.clip_model.logit_scale.exp().detach()) # Temperature
+-        
++        self.train_pairs = torch.tensor([
++            (attr2idx[attr], obj2idx[obj]) for attr, obj in self.dset.train_pairs
++        ])
++
++        self.temp_logit = nn.Parameter(self.clip_model.logit_scale.exp().detach())
++
++        # ---- CoDA add-ons ----
++        self.use_coda = bool(getattr(args, "use_coda", True))
++        self.use_mid = bool(getattr(args, "use_mid", True)) and self.use_coda
++        self.use_faca = bool(getattr(args, "use_faca", True)) and self.use_coda
++
++        embed_dim = self.csp.soft_att_obj.size(-1) if False else 768
++        # Pull the actual embedding dim from CLIP's text projection to be safe.
++        embed_dim = self.clip_model.text_projection.shape[-1]
++        self.embed_dim = embed_dim
++
++        if self.use_mid:
++            self.club = CLUB(embed_dim, hidden=embed_dim)
++        else:
++            self.club = None
++
++        # Orthogonal reg target — apply on the visual proj_att / proj_obj heads.
++        self.lambda_orth = float(getattr(args, "lambda_orth", 0.0))
++
++        # FACA setup
++        self.fuser = ComposeFuser(embed_dim) if self.use_faca else None
++        self.bank_attr = FeatureBank(len(self.dset.attrs), max_per_class=int(getattr(args, "bank_size", 128))) if self.use_faca else None
++        self.bank_obj = FeatureBank(len(self.dset.objs), max_per_class=int(getattr(args, "bank_size", 128))) if self.use_faca else None
++
++        # Training-time bookkeeping (must be set before _load_feasibility_for_train).
++        self.current_epoch = 0
++        self.faca_warmup_epochs = int(getattr(args, "faca_warmup_epochs", 1))
++        self.n_synth_per_batch = int(getattr(args, "n_synth_per_batch", 8))
++        self.tau_high = float(getattr(args, "tau_high", 0.7))
++
++        self.feasible_unseen = []  # list of (attr_idx, obj_idx, weight)
++        if self.use_faca:
++            self._load_feasibility_for_train()
++
++    # ------------------------------------------------------------------
++    # Feasibility lookup for FACA training-time augmentation.
++    # ------------------------------------------------------------------
++    def _load_feasibility_for_train(self):
++        path = getattr(self.args, "feasibility_train", None) or getattr(self.args, "feasibility", None)
++        if not path or not os.path.isfile(path):
++            print(f"[CoDA] feasibility file not found at {path}; disabling FACA augmentation.")
++            self.use_faca = False
++            return
++        blob = torch.load(path, map_location="cpu", weights_only=True)
++        feas = blob["feasibility"] if isinstance(blob, dict) else blob
++
++        attrs = list(self.dset.attrs)
++        objs = list(self.dset.objs)
++        attr2idx = self.dset.attr2idx
++        obj2idx = self.dset.obj2idx
++
++        feas = feas.float().view(-1)
++        n_full = len(attrs) * len(objs)
++        if feas.numel() == n_full:
++            # Outer-product order: (a0,o0),(a0,o1),...,(a_last, o_last)
++            full_pairs = list(product(attrs, objs))
++        elif feas.numel() == len(self.dset.pairs):
++            full_pairs = list(self.dset.pairs)
++        else:
++            print(
++                f"[CoDA] feasibility tensor size {feas.numel()} matches neither "
++                f"|A|*|O|={n_full} nor len(pairs)={len(self.dset.pairs)}. "
++                f"Disabling FACA augmentation."
++            )
++            self.use_faca = False
++            return
++
++        train_pair_set = set(self.dset.train_pairs)
++        unseen = []
++        for (a, o), f in zip(full_pairs, feas.tolist()):
++            if (a, o) in train_pair_set:
++                continue
++            if f < self.tau_high:
++                continue
++            unseen.append((attr2idx[a], obj2idx[o], float(f)))
++        print(f"[CoDA] FACA: {len(unseen)} feasible unseen pairs (tau_high={self.tau_high}).")
++        if len(unseen) == 0:
++            self.use_faca = False
++            return
++        self.feasible_unseen = unseen
++
++    def set_epoch(self, epoch):
++        self.current_epoch = int(epoch)
++
++    # ------------------------------------------------------------------
++    # Forward.
++    # ------------------------------------------------------------------
+     def forward(self, data):
+-        img, att_id, obj_id , pair_id = data[0] , data[1], data[2] , data[3] 
+-
+-        # Obtain the semantic representations of the four branches.
+-        att,obj,com,glb = self.image_encoder(img)
+-        att_semantic_reps = F.normalize(att, p=2, dim=-1) 
+-        obj_semantic_reps = F.normalize(obj, p=2, dim=-1) 
+-        com_semantic_reps = F.normalize(com, p=2, dim=-1) 
+-        glb_semantic_reps = F.normalize(glb, p=2, dim=-1)
+-        
+-        # Obtain the prompt representations.
+-        token_com,token_att,token_obj = self.csp.construct_token_tensors(self.train_pairs)
+-        com_prompt_reps,att_prompt_reps,obj_prompt_reps = self.get_text_features(token_com,token_att,token_obj)
+-        
+-        
+-        # Align the four branches. 
+-        att_branch = self.temp_logit * att_semantic_reps @ att_prompt_reps.T
+-        obj_branch = self.temp_logit * obj_semantic_reps @ obj_prompt_reps.T
+-        com_branch = self.temp_logit * com_semantic_reps @ com_prompt_reps.T
+-        glb_branch = self.temp_logit * glb_semantic_reps @ com_prompt_reps.T
+-        
+-        att_loss = F.cross_entropy(att_branch , att_id)
+-        obj_loss = F.cross_entropy(obj_branch , obj_id)
+-        com_loss = F.cross_entropy(com_branch , pair_id)
+-        glb_loss = F.cross_entropy(glb_branch , pair_id)
+-                     
+-        total_loss = self.args.att_loss_weight * att_loss + \
+-                     self.args.obj_loss_weight * obj_loss + \
+-                     self.args.com_loss_weight * com_loss + \
+-                     self.args.glb_loss_weight * glb_loss
+-
+-        return total_loss
+-    
+-    def get_text_features(self,token_com,token_att,token_obj):
+-        text_features_com = self.text_encoder(
+-            self.csp.token_ids[0],
+-            token_com,
+-            enable_pos_emb=True
+-        )  
+-        text_features_att = self.text_encoder(
+-            self.csp.token_ids[1],
+-            token_att,
+-            enable_pos_emb=True
+-        )  
+-        text_features_obj = self.text_encoder(
+-            self.csp.token_ids[2],
+-            token_obj,
+-            enable_pos_emb=True
+-        )  
+-        text_features_com = F.normalize(text_features_com, p=2, dim=-1)  
+-        text_features_att = F.normalize(text_features_att, p=2, dim=-1)  
+-        text_features_obj = F.normalize(text_features_obj, p=2, dim=-1)  
+-        return text_features_com,text_features_att,text_features_obj
+-    
++        img, att_id, obj_id, pair_id = data[0], data[1], data[2], data[3]
++
++        # Visual branches.
++        att, obj, com, glb = self.image_encoder(img)
++        att_n = F.normalize(att, p=2, dim=-1)
++        obj_n = F.normalize(obj, p=2, dim=-1)
++        com_n = F.normalize(com, p=2, dim=-1)
++        glb_n = F.normalize(glb, p=2, dim=-1)
++
++        # Train-pair prompt features.
++        token_com, token_att, token_obj = self.csp.construct_token_tensors(self.train_pairs)
++        com_p, att_p, obj_p = self.get_text_features(token_com, token_att, token_obj)
++
++        att_branch = self.temp_logit * att_n @ att_p.T
++        obj_branch = self.temp_logit * obj_n @ obj_p.T
++        com_branch = self.temp_logit * com_n @ com_p.T
++        glb_branch = self.temp_logit * glb_n @ com_p.T
++
++        att_loss = F.cross_entropy(att_branch, att_id)
++        obj_loss = F.cross_entropy(obj_branch, obj_id)
++        com_loss = F.cross_entropy(com_branch, pair_id)
++        glb_loss = F.cross_entropy(glb_branch, pair_id)
++
++        base_loss = (
++            self.args.att_loss_weight * att_loss
++            + self.args.obj_loss_weight * obj_loss
++            + self.args.com_loss_weight * com_loss
++            + self.args.glb_loss_weight * glb_loss
++        )
++
++        out = {
++            "base": base_loss,
++            "att_loss": att_loss.detach(),
++            "obj_loss": obj_loss.detach(),
++            "com_loss": com_loss.detach(),
++            "glb_loss": glb_loss.detach(),
++            "f_a": att_n,
++            "f_o": obj_n,
++            "att_id": att_id,
++            "obj_id": obj_id,
++        }
++
++        # Orthogonal regularization on the projection heads (cheap, stabilizing).
++        if self.lambda_orth > 0:
++            w_a = self.clip_model.visual.proj_att
++            w_o = self.clip_model.visual.proj_obj
++            # w_a: [1024, embed_dim]; orth on the embed-side columns.
++            orth = (w_a.t() @ w_o).pow(2).mean()
++            out["orth"] = orth
++        else:
++            out["orth"] = torch.zeros((), device=att_n.device)
++
++        # FACA augmentation — only after warmup and if banks have anything.
++        out["aug"] = self._faca_loss(device=att_n.device)
++        return out
++
++    # ------------------------------------------------------------------
++    # FACA loss.
++    # ------------------------------------------------------------------
++    def _faca_loss(self, device):
++        if (
++            not self.use_faca
++            or self.fuser is None
++            or self.current_epoch < self.faca_warmup_epochs
++            or len(self.feasible_unseen) == 0
++        ):
++            return torch.zeros((), device=device)
++
++        import random
++        # Try up to a multiple of n_synth_per_batch to fill, in case bank misses.
++        target_n = self.n_synth_per_batch
++        max_tries = target_n * 4
++        chosen = []
++        for _ in range(max_tries):
++            if len(chosen) >= target_n:
++                break
++            a, o, w = random.choice(self.feasible_unseen)
++            if not (self.bank_attr.has(a) and self.bank_obj.has(o)):
++                continue
++            chosen.append((a, o, w))
++        if len(chosen) == 0:
++            return torch.zeros((), device=device)
++
++        f_a_list = [self.bank_attr.sample(a) for (a, o, _w) in chosen]
++        f_o_list = [self.bank_obj.sample(o) for (a, o, _w) in chosen]
++        f_a_stack = torch.stack(f_a_list, dim=0).to(device, non_blocking=True)
++        f_o_stack = torch.stack(f_o_list, dim=0).to(device, non_blocking=True)
++        f_a_stack = f_a_stack.to(self.fuser.net[0].weight.dtype)
++        f_o_stack = f_o_stack.to(self.fuser.net[0].weight.dtype)
++
++        weights = torch.tensor([c[2] for c in chosen], device=device, dtype=f_a_stack.dtype)
++
++        # Compose to a synthetic compositional rep.
++        f_c_syn = self.fuser(f_a_stack, f_o_stack)
++        f_c_syn = F.normalize(f_c_syn, p=2, dim=-1)
++
++        # Prompt rep for each synthetic pair.
++        pair_idx = torch.tensor([(a, o) for (a, o, _w) in chosen], device=device, dtype=torch.long)
++        token_com, _, _ = self.csp.construct_token_tensors(pair_idx)
++        # Only need the composition prompt branch.
++        t_c_syn = self.text_encoder(self.csp.token_ids[0], token_com, enable_pos_emb=True)
++        t_c_syn = F.normalize(t_c_syn, p=2, dim=-1)
++
++        logits = self.temp_logit * f_c_syn @ t_c_syn.T
++        targets = torch.arange(len(chosen), device=device)
++        ce = F.cross_entropy(logits, targets, reduction="none")
++        return (ce * weights).mean()
++
++    def update_banks(self, f_a, f_o, att_id, obj_id):
++        if not self.use_faca:
++            return
++        # Save normalized features so synthesis stays in a consistent space.
++        self.bank_attr.update(f_a.detach(), att_id)
++        self.bank_obj.update(f_o.detach(), obj_id)
++
++    # ------------------------------------------------------------------
++    # Text feature helper (unchanged from CAMS).
++    # ------------------------------------------------------------------
++    def get_text_features(self, token_com, token_att, token_obj):
++        text_com = self.text_encoder(self.csp.token_ids[0], token_com, enable_pos_emb=True)
++        text_att = self.text_encoder(self.csp.token_ids[1], token_att, enable_pos_emb=True)
++        text_obj = self.text_encoder(self.csp.token_ids[2], token_obj, enable_pos_emb=True)
++        text_com = F.normalize(text_com, p=2, dim=-1)
++        text_att = F.normalize(text_att, p=2, dim=-1)
++        text_obj = F.normalize(text_obj, p=2, dim=-1)
++        return text_com, text_att, text_obj

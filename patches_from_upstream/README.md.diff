@@ -1,0 +1,291 @@
+--- a/README.md
++++ b/README.md
+@@ -1,39 +1,193 @@
+-# CAMS: Towards Compositional Zero-Shot Learning via Gated Cross-Attention and Multi-Space Disentanglement
+-
+-* **Title**: **[CAMS: Towards Compositional Zero-Shot Learning via Gated Cross-Attention and Multi-Space Disentanglement](https://arxiv.org/pdf/2511.16378)**
+-* **Authors**: **Pan Yang**, **Cheng Deng**, **Jing Yang**, **Han Zhao**, **Yun Liu**, **Yuling Chen**, **Xiaoli Ruan**, **Yanping Chen**
+-* **Institutes**: Guizhou University, Shanghai Jiao Tong University, Nankai University
+-
+-## Overview
+-<p align="center">
+-  <img src="https://github.com/ybyangjing/CAMS/blob/main/img/framework.png">
+-</p>
+-
+-Compositional zero-shot learning (CZSL) aims to recognize unseen attribute–object compositions from seen ones, but CLIP-based methods often suffer from limited disentanglement due to the restricted capacity of global representations. We propose CAMS, a semantic disentangled framework that leverages high-level semantic features, employs Gated Cross-Attention to adaptively extract fine-grained visual features, and applies Multi-Space Disentanglement to align semantic features with prompts, improving generalization to unseen compositions. Evaluated on MIT-States, UT-Zappos, and C-GQA, CAMS achieves state-of-the-art performance, boosting HM by up to **+9.3%** and AUC by **+12.4%** in both closed-world and open-world settings.
+-
+-## Environment 
+-The model code is implemented based on the PyTorch framework. The experimental environment includes:
+-
+-- Ubuntu20.04
+-- Intel(R) Core(TM) i9-12900K CPU
+-- 128GB RAM
+-- NVIDIA RTX 6000 GPU
+-
+-## Dataset
+-We experiment with three datasets: MIT-States, UT-Zappos, and C-GQA.
+-The three datasets can be downloaded by clicking [here](https://pan.baidu.com/s/1EjuOntesOsOlE26wpu2kAg?pwd=4g4b).
+-
+-You only need to modify the **config file path** and the corresponding **dataset_path** in ``CAMS\flags.py``.
+-## Results
+-### Main Results
+-
+-The following results show the closed-world and open-world performance of CAMS, compared with state-of-the-art methods using the same backbone (ViT-L/14). Additional experimental results can be found in the paper.
+-<p align="center">
+-  <img src="https://github.com/ybyangjing/CAMS/blob/main/img/main_results.png" alt="main_results">
+-</p>
+-
+-## Citation
+-If you find this work useful in your research, please cite our paper:
++# CoDA-CZSL: Conditional Disentanglement with Feasibility-Aware Augmentation for Compositional Zero-Shot Learning
++
++基于 **CAMS** ([arXiv:2511.16378](https://arxiv.org/pdf/2511.16378)) 的延续性研究，在其多空间解耦框架上引入三个新模块：
++
++| 模块 | 功能 | 实现位置 |
++|---|---|---|
++| **OCAD** (Object-Conditioned Attribute Decoder) | 用对象表征通过 FiLM 调制属性提取器，建模属性的上下文依赖性 | `clip_modules/gca.py`（`FiLM` + `VisionTransformer`） |
++| **MID** (Mutual Information Disentanglement) | 用 CLUB 显式估计并最小化 I(f_a; f_o) | `model/coda_modules.py`（`CLUB`），双 optimizer 训练 |
++| **FACA** (Feasibility-Aware Compositional Augmentation) | LLM 评分 + memory bank 特征级合成可行未见组合 | `model/coda_modules.py`（`FeatureBank`、`ComposeFuser`），训练 + OW 推理软偏置 |
++
++> 详见 `CoDA-CZSL_proposal.md`。
++
++---
++
++## 1. 环境
++
++依赖与原 CAMS 一致：
++
++- PyTorch（支持 `torch.amp`）
++- CLIP ViT-L/14 预训练权重（路径在 yml 的 `clip_model` 字段）
++
++GPU 显存建议 ≥ 24GB（C-GQA OW 推理时矩阵较大）。
++
++---
++
++## 2. 数据集 & 路径
++
++三个数据集照旧：**MIT-States / UT-Zappos / C-GQA**。在你这台机器上路径已经准备好：
++
++```
++./8222/all_data/mit-states
++./8222/all_data/ut-zap50k
++./8222/all_data/cgqa
++```
++
++可行性矩阵（FACA 训练 + OW 推理都用）已预计算好并放在 `feasibilities/`：
++
++```
++feasibilities/feasibility_mit.pt
++feasibilities/feasibility_zp.pt
++feasibilities/feasibility_cgqa.pt
++```
++
++如需重新生成可参考方案 §5.2 的 LLM 评分脚本（GPT-4o-mini 或本地 vLLM + Qwen2.5）。
++
++---
++
++## 3. 训练
++
++### 闭世界（默认）
++
++```bash
++# MIT-States
++CUDA_VISIBLE_DEVICES=0 python3 train.py \
++  --config configs/mit-states.yml \
++  --dataset_path ./8222/all_data/mit-states
++
++# UT-Zappos
++CUDA_VISIBLE_DEVICES=0 python3 train.py \
++  --config configs/utzappos.yml \
++  --dataset_path ./8222/all_data/ut-zap50k
++
++# C-GQA
++CUDA_VISIBLE_DEVICES=2 python3 train.py \
++  --config configs/cgqa.yml \
++  --dataset_path ./8222/all_data/cgqa
++```
++
++训练流程关键点：
++
++1. 每 iteration **双 optimizer**：
++   - Step 1: 用 `f_a.detach(), f_o.detach()` 更新 CLUB 的 `q_phi`（最大化 likelihood）。
++   - Step 2: 用更新后的 `q_phi` 估计 MI 上界，加进主损失 `L_base + λ_MI·MI + λ_aug·L_aug + λ_orth·L_orth`，更新主网络。
++2. **λ_MI 线性 warmup**：默认前 2 epoch 线性升到目标值（防止 q_phi 还没拟合就压主网络）。
++3. **FACA 从 `faca_warmup_epochs` 开始**：默认从 epoch 1 起触发，让 memory bank 先攒到特征。
++4. 训练结束后自动在测试集上做闭世界评估。
++
++### 开放世界
++
++在 yml 里 `test.open_world: true` 已经默认开了，跑测试时加 `--open_world`：
++
++```bash
++CUDA_VISIBLE_DEVICES=3 python3 test.py \
++  --config configs/utzappos.yml \
++  --dataset_path ./8222/all_data/ut-zap50k \
++  --open_world
++
++CUDA_VISIBLE_DEVICES=3 python3 test.py \
++  --config configs/mit-states.yml \
++  --dataset_path ./8222/all_data/mit-states \
++  --open_world
++
++CUDA_VISIBLE_DEVICES=0 python3 test.py \
++  --config configs/cgqa.yml \
++  --dataset_path ./8222/all_data/cgqa \
++  --open_world
++```
++
++OW 推理时同时启用：
++- CAMS 原有的**硬阈值**特征过滤（`threshold` + `feasibility_*.pt`）
++- **CoDA 新增的软偏置** `γ_feas · log(F + ε)`（由 yml 里 `gamma_feas` 控制；置 0 即回退到纯 CAMS 推理）
++
++---
++
++## 4. 关键超参数（在 yml 中调）
++
++| 超参 | 含义 | 默认初始值（按数据集） |
++|---|---|---|
++| `lambda_MI` | CLUB MI 上界损失权重 | MIT 0.10 / Zp 0.05 / C-GQA 0.15 |
++| `lambda_aug` | FACA 合成 CE 损失权重 | MIT 0.30 / Zp 0.20 / C-GQA 0.50 |
++| `lambda_orth` | 投影头正交正则权重 | 0.01 |
++| `club_lr` | CLUB `q_phi` 学习率 | 1e-4 |
++| `mi_warmup_epochs` | λ_MI 线性 warmup epoch 数 | 2 |
++| `tau_high` | 可行性阈值，控制哪些未见对进入 FACA 采样池 | MIT 0.7 / Zp 0.8 / C-GQA 0.6 |
++| `n_synth_per_batch` | 每个 batch 合成的伪组合数 | MIT 8 / Zp 4 / C-GQA 16 |
++| `bank_size` | 每类别 memory bank 容量 | 128 |
++| `faca_warmup_epochs` | 头 N 个 epoch 不做 FACA（让 bank 攒特征） | 1 |
++| `gamma_feas` | OW 推理软可行性偏置权重 | MIT 0.3 / Zp 0.1 / C-GQA 0.4 |
++
++参考来源：方案 §5.3 表格。
++
++---
++
++## 5. 消融实验
++
++三个模块都有独立开关，直接改 yml 的 `model:` 区段：
++
++```yaml
++model:
++  use_coda: true     # 总开关：关掉则等价于原 CAMS
++  use_ocad: true     # 关掉 → 属性分支不再被对象条件化
++  use_mid: true      # 关掉 → 不构建 CLUB，也不进 λ_MI 项
++  use_faca: true     # 关掉 → 不做特征级合成增强
++```
++
++或在命令行用对应 flag 覆盖（见 `flags.py`）。
++
++提案 §6.3 推荐的最小消融组：
++
++| 配置 | yml 改动 |
++|---|---|
++| Baseline (复现 CAMS) | `use_coda: false`（或三个子开关都关）+ `gamma_feas: 0` |
++| + OCAD | `use_ocad: true`, `use_mid: false`, `use_faca: false` |
++| + MID | `use_ocad: false`, `use_mid: true`, `use_faca: false` |
++| + FACA | `use_ocad: false`, `use_mid: false`, `use_faca: true` |
++| + OCAD + MID | `use_faca: false` |
++| Full CoDA | 三个都 true |
++
++---
++
++## 6. 代码结构（CoDA 新增 / 改动）
++
++```
++CoDA/
++├── clip_modules/
++│   └── gca.py                  # 改：VisionTransformer 内加 FiLM（OCAD）
++├── model/
++│   ├── coda_modules.py         # 新：CLUB / FeatureBank / ComposeFuser
++│   ├── cams.py                 # 改：集成 OCAD/MID/FACA，forward 返回 dict
++│   └── configure_model.py      # 改：双 optimizer，扩展可训练参数关键字
++├── configs/
++│   ├── mit-states.yml          # 改：加 CoDA 超参
++│   ├── utzappos.yml            # 改：加 CoDA 超参
++│   └── cgqa.yml                # 改：加 CoDA 超参
++├── feasibilities/              # 三个数据集的 LLM 可行性矩阵
++├── train.py                    # 改：双更新循环 + bank 更新 + λ_MI warmup
++├── test.py                     # 改：OW 推理加软可行性 log-bias
++├── flags.py                    # 改：加 CoDA 相关命令行 / yml 字段
++└── CoDA-CZSL_proposal.md       # 完整研究方案
++```
++
++未改动文件：`dataset.py / utils.py / common.py / model/csp.py / clip_modules/{clip.py, model.py, text_encoder.py, simple_tokenizer.py}`。
++
++---
++
++## 7. 训练输出
++
++进度条会显示三个量：
++
++- `loss`：最近 50 步主损失移动均值
++- `mi`：当前 batch CLUB 估计的 MI 上界（如果 MID 在跑）—— 训练中应**逐步下降**
++- `aug`：当前 batch FACA 合成 CE 损失（如果 FACA 在跑且 bank 已经准备好）
++
++每个 epoch 末自动在 val 上评估 S / U / HM / AUC，保存 `val_best.pt`；最后一个 epoch 末在 test 上跑一次。
++
++---
++
++## 8. 引用
++
++CAMS 基线：
+ 
+ ```
+ @article{yang2025cams,
+@@ -44,58 +198,4 @@
+ }
+ ```
+ 
+-
+-## Acknowledgement
+-Our code references the following project:
+-* [Troika](https://github.com/bighuang624/Troika)
+-
+-## Contact
+-**If you have any questions you can contact us : gs.pyang24@gzu.edu.cn or jyang23@gzu.edu.cn**
+-
+-
+-cd CAMS-main
+-CUDA_VISIBLE_DEVICES=3 python train.py \
+-  --config configs/mit-states.yml \
+-  --dataset_path ./8222/all_data/mit-states
+-
+-# 训练 UT-Zappos
+-CUDA_VISIBLE_DEVICES=2 python train.py \
+-  --config configs/utzappos.yml \
+-  --dataset_path ./8222/all_data/ut-zap50k
+-
+-# 训练 C-GQA
+-CUDA_VISIBLE_DEVICES=2 python train.py \d
+-  --config configs/cgqa.yml \
+-  --dataset_path ./8222/all_data/cgqa
+-
+-训练结束时会自动在 test set 上评估，输出指标包括：
+-
+-best_seen / best_unseen / best_hm / AUC
+-
+-如果只想单独跑测试，修改配置文件中的 load_model 字段：
+-yamltest:
+-  load_model: CAMS/weight/val_best.pt  # 改为你的模型路径
+-
+-
+-
+-开放世界（Open-World）设置
+-
+-# MIT-States 开放世界
+-CUDA_VISIBLE_DEVICES=3 python test.py \
+-  --config configs/mit-states.yml \
+-  --dataset_path ./8222/all_data/mit-states \
+-  --open_world
+-
+-# UT-Zappos 开放世界
+-CUDA_VISIBLE_DEVICES=1 python test.py \
+-  --config configs/utzappos.yml \
+-  --dataset_path ./8222/all_data/ut-zap50k \
+-  --open_world
+-
+-
+-
+-# C-GQA 开放世界
+-CUDA_VISIBLE_DEVICES=2 python test.py \
+-  --config configs/cgqa.yml \
+-  --dataset_path ./8222/all_data/cgqa \
+-  --open_world+CoDA-CZSL 引用方案文档 `CoDA-CZSL_proposal.md`。其他参考：Troika (CVPR 2024)、CLUB (ICML 2020)、FiLM (AAAI 2018)、CLUSPRO (ICLR 2025)、KG-SP (CVPR 2022)。
